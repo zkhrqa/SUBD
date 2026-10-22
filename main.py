@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QTabWidget,
+    QStackedWidget,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -663,15 +663,13 @@ class MainWindow(QMainWindow):
         self.path = path
         self.analysis_windows = {}
         self.db = self.connect_db(path)
-        self.tabs = QTabWidget()
+        self.table_stack = QStackedWidget()
         self.pages: dict[str, TablePage] = {}
         for name in ("nir", "financing", "vuz", "grnti"):
             page = TablePage(self.db, name)
             self.pages[name] = page
-            self.tabs.addTab(page, TABLE_CONFIG[name]["title"])
-        self.tabs.setElideMode(Qt.TextElideMode.ElideNone)
-        self.tabs.setUsesScrollButtons(True)
-        self.setCentralWidget(self.tabs)
+            self.table_stack.addWidget(page)
+        self.setCentralWidget(self.table_stack)
         self.pages["nir"].before_nir_change = self.save_financing_if_dirty
         self.pages["nir"].reload_after_nir_change = self.reload_database_views
         self.pages["financing"].after_table_save = self.reload_database_views
@@ -736,7 +734,7 @@ class MainWindow(QMainWindow):
             action = menu_data.addAction(TABLE_CONFIG[name]["title"])
             action.setCheckable(True)
             self.data_action_group.addAction(action)
-            action.triggered.connect(lambda checked=False, widget=page: self.tabs.setCurrentWidget(widget))
+            action.triggered.connect(lambda checked=False, widget=page: self.table_stack.setCurrentWidget(widget))
             self.data_actions[name] = action
 
         menu_analysis = bar.addMenu("Анализ")
@@ -767,12 +765,12 @@ class MainWindow(QMainWindow):
         menu_help.addAction("Справка").triggered.connect(self.show_help)
         menu_help.addAction("О программе").triggered.connect(self.show_about)
         bar.addAction("Выход").triggered.connect(self.close)
-        self.tabs.currentChanged.connect(self.update_current_table)
+        self.table_stack.currentChanged.connect(self.update_current_table)
         self.update_current_table()
 
     def update_current_table(self, *_):
         for name, page in self.pages.items():
-            current = self.tabs.currentWidget() is page
+            current = self.table_stack.currentWidget() is page
             self.data_actions[name].setChecked(current)
 
     def save_all(self):
@@ -800,7 +798,7 @@ class MainWindow(QMainWindow):
         self.auto_check(show_dialog=False)
 
     def edit_nir(self):
-        self.tabs.setCurrentWidget(self.pages["nir"])
+        self.table_stack.setCurrentWidget(self.pages["nir"])
         if not self.pages["nir"].view.currentIndex().isValid():
             QMessageBox.information(self, "Редактировать НИР", "Выберите НИР в таблице и нажмите «Изменить».")
             return
@@ -890,7 +888,7 @@ class MainWindow(QMainWindow):
             self,
             "Справка",
             "ЛР №1, вариант 9.\n\n"
-            "• Таблицы переключаются вкладками сверху или через меню «Данные» внутри окна.\n"
+            "• Таблицы переключаются через выпадающее меню «Данные» внутри окна.\n"
             "• VUZ и ГРНТИ — только просмотр.\n"
             "• RNW сохраняется без пробелов.\n"
             "• НИР добавляются и изменяются через формы; удаление требует подтверждения.\n"

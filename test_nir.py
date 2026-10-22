@@ -12,7 +12,6 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6 import sip
 from PyQt6.QtCore import Qt
-from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from database import rebuild_financing, run_validation
@@ -462,18 +461,17 @@ class NirTests(unittest.TestCase):
             self.assertFalse(window.menuBar().isNativeMenuBar())
             window.show()
             self.app.processEvents()
-            self.assertTrue(window.tabs.tabBar().isVisible())
-            self.assertEqual(window.tabs.elideMode(), Qt.TextElideMode.ElideNone)
+            self.assertIs(window.centralWidget(), window.table_stack)
+            self.assertEqual(window.table_stack.count(), 4)
             self.assertIsNone(window.menuBar().cornerWidget(Qt.Corner.TopRightCorner))
             self.assertEqual(list(window.data_actions), ['nir', 'financing', 'vuz', 'grnti'])
             window.data_actions['vuz'].trigger()
-            self.assertIs(window.tabs.currentWidget(), window.pages['vuz'])
+            self.assertIs(window.table_stack.currentWidget(), window.pages['vuz'])
             self.assertTrue(window.data_actions['vuz'].isChecked())
             self.assertFalse(window.data_actions['nir'].isChecked())
-            for index, name in enumerate(window.pages):
-                QTest.mouseClick(window.tabs.tabBar(), Qt.MouseButton.LeftButton,
-                                 pos=window.tabs.tabBar().tabRect(index).center())
-                self.assertIs(window.tabs.currentWidget(), window.pages[name])
+            for name in window.pages:
+                window.data_actions[name].trigger()
+                self.assertIs(window.table_stack.currentWidget(), window.pages[name])
                 self.assertTrue(window.data_actions[name].isChecked())
         finally:
             window.close()
@@ -730,7 +728,7 @@ class NirTests(unittest.TestCase):
     def test_analysis_menu_opens_reuses_and_refreshes_current_data(self):
         window = MainWindow(self.path)
         try:
-            self.assertEqual(window.tabs.count(), 4)
+            self.assertEqual(window.table_stack.count(), 4)
             window.analysis_actions['vuz'].trigger()
             report = window.analysis_windows['vuz']
             self.assertTrue(report.isVisible())
