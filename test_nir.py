@@ -226,7 +226,7 @@ class NirTests(unittest.TestCase):
             self.assertEqual([page.model.record(i).value("id") for i in range(3)], [1, 2, 3])
             page.view.sortByColumn(page.field_names.index("codvuz"), Qt.SortOrder.DescendingOrder)
             self.assertEqual(page.model.record(0).value("id"), 3)
-            page.key_sort_button.click()
+            page.apply_sort()
             self.assertEqual([page.model.record(i).value("id") for i in range(3)], [1, 2, 3])
             window.shared_filters.update({}, "20")
             self.assertEqual(page.model.rowCount(), 2)
@@ -280,7 +280,7 @@ class NirTests(unittest.TestCase):
             page.view.sortByColumn(page.field_names.index("codvuz"), Qt.SortOrder.DescendingOrder)
             self.assertEqual(page.model.record(0).value("codvuz"), 2)
             page.select_record(dialog.saved_id)
-            page.key_sort_button.click()
+            page.apply_sort()
             self.assertEqual(page.selected_record()["id"], dialog.saved_id)
             self.assertEqual([page.model.record(i).value("rnw") for i in range(4)], ['018', '019', '020', '7'])
         finally:
@@ -541,31 +541,32 @@ class NirTests(unittest.TestCase):
         window = MainWindow(self.path)
         try:
             page = window.pages['nir']
-            self.assertIs(page.search_edit.window(), page.search_dialog)
+            self.assertTrue(hasattr(window, "search_input"))
+            # Селектор находится внутри единого поисковика, а не в отдельной рамке.
+            self.assertIs(window.search_field_selector.parent(), window.search_box)
+            self.assertLess(window.search_field_selector.width(), 165)
+            # Над таблицей нет старой полосы с подсказкой.
+            self.assertIs(page.layout().itemAt(0).widget(), page.view)
             window.shared_filters.update({'city': 'Москва'}, None)
-            def cancel_search():
-                page.search_field.setCurrentIndex(page.search_field.findData('f2'))
-                page.search_edit.setText('ПЕРВАЯ')
-                self.assertEqual(page.model.rowCount(), 3)
-                return QDialog.DialogCode.Rejected
-            with patch.object(page.search_dialog, 'exec', side_effect=cancel_search):
-                window.search_button.click()
-            self.assertEqual(page.search_edit.text(), '')
-            def apply_search():
-                page.search_field.setCurrentIndex(page.search_field.findData('f2'))
-                page.search_edit.setText('первая')
-                page.accept_search()
-                return page.search_dialog.result()
-            with patch.object(page.search_dialog, 'exec', side_effect=apply_search):
-                page.open_search()
-            self.assertEqual(page.model.rowCount(), 1)
-            self.assertEqual(window.shared_filters.geography['city'], 'Москва')
-            page.clear_filter()
+            window.search_field_selector.setCurrentIndex(
+                window.search_field_selector.findData('f2'))
+            window.search_input.setText('первая')
             self.assertEqual(page.search_edit.text(), 'первая')
             self.assertEqual(page.model.rowCount(), 1)
-            page.clear_search()
+            self.assertEqual(window.shared_filters.geography['city'], 'Москва')
+            # Поле поиска и строка меняются в одной верхней панели при смене вкладки.
+            window.tabs.setCurrentWidget(window.pages['vuz'])
+            self.assertEqual(window.search_input.text(), '')
+            self.assertEqual(window.search_field_selector.itemData(0), 'codvuz')
+            window.tabs.setCurrentWidget(page)
+            self.assertEqual(window.search_input.text(), 'первая')
+            self.assertEqual(window.search_field_selector.currentData(), 'f2')
+            page.clear_filter()
+            self.assertEqual(window.search_input.text(), 'первая')
+            self.assertEqual(page.model.rowCount(), 1)
+            window.search_input.clear()
             self.assertEqual(page.model.rowCount(), 4)
-            page.search_edit.setText('%_')
+            window.search_input.setText('%_')
             self.assertEqual(page.model.rowCount(), 1)
             self.assertEqual(page.model.record(0).value('rnw'), 'ТЕКСТ')
             row = self.rows("SELECT * FROM nir WHERE rnw='ТЕКСТ'")[0]

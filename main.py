@@ -13,14 +13,12 @@ from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
-    QDialogButtonBox,
-    QFormLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
     QFileDialog,
+    QFrame,
     QMessageBox,
     QPushButton,
     QTabWidget,
@@ -37,6 +35,7 @@ from shared_filters import SharedFilters, UnifiedFilterDialog
 from analysis_forms import AnalysisDialog
 from analysis_reports import REPORTS
 from report_export import write_all_nir_excel
+from export_filename import dated_excel_filename
 
 
 TABLE_CONFIG = {
@@ -213,6 +212,9 @@ class TablePage(QWidget):
         self.view.setAlternatingRowColors(True)
         self.view.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.view.setSelectionMode(QTableView.SelectionMode.SingleSelection)
+        # Убираем пустой угловой блок в левом верхнем углу таблицы
+        # (corner button над вертикальным заголовком).
+        self.view.setCornerButtonEnabled(False)
         self.view.horizontalHeader().setStretchLastSection(table_name in {"nir", "vuz"})
         self.view.resizeColumnsToContents()
         if table_name == "nir":
@@ -239,38 +241,24 @@ class TablePage(QWidget):
             self.model.rowsInserted.connect(lambda *_: self.row_resize_timer.start())
         self.apply_column_widths()
 
-        self.editing_filter = False
-        self.editing_search = False
-        self.search_dialog = QDialog(self)
-        self.search_dialog.setWindowTitle(f"Поиск — {cfg['title']}")
-        self.search_dialog.resize(540, 180)
-        search_dialog_layout = QVBoxLayout(self.search_dialog)
-        search_group = QGroupBox("Найти текст в выбранном поле")
-        search_layout = QFormLayout(search_group)
-        self.search_field = QComboBox()
+        # Храним поисковые значения отдельно для каждой вкладки; сами элементы
+        # ввода отображаются в единой строке поиска главного окна.
+        self.search_field = QComboBox(self)
         for field in self.field_names:
             if field != "id":
                 self.search_field.addItem(cfg["headers"].get(field, field), field)
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Введите слово или часть текста")
+        self.search_edit = QLineEdit(self)
+        # Состояние поиска хранится отдельно для каждой таблицы, но вводить
+        # запрос пользователь должен только через общую верхнюю строку.
+        # Эти дочерние виджеты не входят в layout; без hide() Qt показывает
+        # их поверх верхнего левого угла таблицы при отображении страницы.
+        self.search_field.hide()
+        self.search_edit.hide()
         self.search_edit.textChanged.connect(self.filter_control_changed)
         self.search_field.currentIndexChanged.connect(self.filter_control_changed)
-        search_layout.addRow("Поле", self.search_field)
-        search_layout.addRow("Содержит", self.search_edit)
-        search_dialog_layout.addWidget(search_group)
-        search_dialog_layout.addWidget(QLabel("Поиск выполняется среди строк, подходящих под выбранные фильтры."))
-        search_buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        search_buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Найти")
-        search_buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
-        self.search_reset_button = search_buttons.addButton("Очистить поиск", QDialogButtonBox.ButtonRole.ResetRole)
-        self.search_reset_button.clicked.connect(self.clear_search)
-        search_buttons.accepted.connect(self.accept_search)
-        search_buttons.rejected.connect(self.search_dialog.reject)
-        search_dialog_layout.addWidget(search_buttons)
         layout = QVBoxLayout(self)
-        hint = QLabel(cfg["hint"])
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        # Убираем служебные подсказки над таблицами: они занимали отдельную
+        # полосу и накладывались на элементы интерфейса при масштабировании.
         # Один общий фильтр находится в верхней панели главного окна.
         layout.addWidget(self.view, 1)
         if table_name == "financing":
@@ -304,12 +292,7 @@ class TablePage(QWidget):
             self.finance_save_button = QPushButton("Сохранить факт")
             self.finance_save_button.clicked.connect(self.save)
             buttons.addWidget(self.finance_save_button)
-        # Поиск и общий фильтр перенесены в верхнюю панель окна.
-        if table_name == "nir":
-            self.key_sort_button = QPushButton("Сортировка по ключу")
-            self.key_sort_button.setToolTip("По возрастанию: сначала код вуза, затем рег. номер внутри вуза.")
-            self.key_sort_button.clicked.connect(self.apply_sort)
-            buttons.addWidget(self.key_sort_button)
+        # Сортировка НИР находится в верхней панели, а не среди кнопок редактирования.
         self.filter_summary = QLabel()
         buttons.addWidget(self.filter_summary, 1)
         layout.addLayout(buttons)
@@ -328,27 +311,8 @@ class TablePage(QWidget):
         if self.open_unified_filter is not None:
             self.open_unified_filter()
 
-    def open_search(self):
-        field, text = self.search_field.currentData(), self.search_edit.text()
-        self.editing_search = True
-        try:
-            if self.search_dialog.exec() != QDialog.DialogCode.Accepted:
-                for widget in (self.search_field, self.search_edit):
-                    widget.blockSignals(True)
-                self.search_field.setCurrentIndex(self.search_field.findData(field))
-                self.search_edit.setText(text)
-                for widget in (self.search_field, self.search_edit):
-                    widget.blockSignals(False)
-        finally:
-            self.editing_search = False
-
     def filter_control_changed(self, *_):
-        if not self.editing_search:
-            self.apply_filter()
-
-    def accept_search(self):
-        if self.apply_filter():
-            self.search_dialog.accept()
+        self.apply_filter()
 
     def clear_search(self):
         blocked = self.search_edit.blockSignals(True)
@@ -361,7 +325,7 @@ class TablePage(QWidget):
         filtered = (any(v is not None for v in self.shared_filters.geography.values()) or
                     self.shared_filters.rubric is not None)
         status = ("Фильтр и поиск применены" if filtered and searched else "Поиск применён" if searched
-                  else "Общий фильтр применён" if filtered else "Без фильтра")
+                  else "Фильтр применён" if filtered else "Без фильтра")
         self.filter_summary.setText(f"{status} · Строк: {self.model.rowCount()}")
         details = []
         if searched:
@@ -504,14 +468,14 @@ class TablePage(QWidget):
     def clear_filter(self):
         self.shared_filters.reset()
 
-    def apply_sort(self, *_):
+    def apply_sort(self, order=Qt.SortOrder.AscendingOrder):
         selected = self.selected_record()
         self.model.key_sort = True
-        self.model.key_order = Qt.SortOrder.AscendingOrder
+        self.model.key_order = order
         header = self.view.horizontalHeader()
         header.setSectionsClickable(True)
         blocked = header.blockSignals(True)
-        header.setSortIndicator(self.field_names.index("codvuz"), Qt.SortOrder.AscendingOrder)
+        header.setSortIndicator(self.field_names.index("codvuz"), order)
         header.blockSignals(blocked)
         header.setSortIndicatorShown(True)
         self.model.select()
@@ -593,7 +557,7 @@ class TablePage(QWidget):
             self.clear_search()
             self.clear_filter()
             self.select_record(row_id)
-            QMessageBox.information(self, "Фильтр сброшен", "Запись сохранена. Общий фильтр сброшен, чтобы показать её в таблице.")
+            QMessageBox.information(self, "Фильтр сброшен", "Запись сохранена. Фильтр сброшен, чтобы показать её в таблице.")
         self.nir_changed.emit(row_id)
 
     def save(self) -> bool:
@@ -643,35 +607,107 @@ class MainWindow(QMainWindow):
             self.tabs.addTab(page, TABLE_CONFIG[name]["title"])
         self.tabs.setElideMode(Qt.TextElideMode.ElideNone)
         self.tabs.setUsesScrollButtons(True)
-        # Глобальная панель действий над вкладками: одна точка доступа к
-        # фильтрам, поиск только по открытой таблице и полный экспорт НИР.
+        # Верхняя панель: общий фильтр/сброс сгруппированы, сортировка НИР
+        # вынесена из нижних кнопок, поиск — строка с выбором столбца.
         central = QWidget()
         central_layout = QVBoxLayout(central)
         central_layout.setContentsMargins(7, 7, 7, 7)
         central_layout.setSpacing(6)
         toolbar = QHBoxLayout()
-        self.filter_button = QPushButton("⚲  Общий фильтр")
+        self.filter_button = QPushButton("⚲  Фильтр")
         self.filter_button.clicked.connect(self.open_shared_filter)
-        self.search_button = QPushButton("🔍  Поиск")
-        self.search_button.clicked.connect(self.open_current_search)
         self.reset_filter_button = QPushButton("Сбросить фильтр")
         self.reset_filter_button.clicked.connect(self.shared_filters.reset)
+        self.sort_label = QLabel("Сортировка НИР:")
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItem("По вузу ↑", "university_asc")
+        self.sort_combo.addItem("По вузу ↓", "university_desc")
+        self.sort_combo.addItem("По рег. номеру ↑", "number_asc")
+        self.sort_combo.addItem("По названию ↑", "title_asc")
+        self.sort_combo.setToolTip("Для других вариантов сортировки можно нажать заголовок столбца таблицы.")
+        self.sort_combo.currentIndexChanged.connect(self.sort_current_nir)
         self.export_all_button = QPushButton("Выгрузить все НИР в Excel")
         self.export_all_button.clicked.connect(self.export_all_nir)
-        self.shared_summary = QLabel()
-        self.shared_summary.setWordWrap(True)
         toolbar.addWidget(self.filter_button)
         toolbar.addWidget(self.reset_filter_button)
-        toolbar.addWidget(self.search_button)
-        toolbar.addWidget(self.shared_summary, 1)
+        toolbar.addSpacing(14)
+        toolbar.addWidget(self.sort_label)
+        toolbar.addWidget(self.sort_combo)
+        toolbar.addStretch(1)
         toolbar.addWidget(self.export_all_button)
         central_layout.addLayout(toolbar)
+
+        search_row = QHBoxLayout()
+        self.search_field_label = QLabel("🔍 Поиск:")
+
+        # Поле выбора столбца и ввод текста визуально образуют одну строку.
+        # Рамка рисуется только вокруг общего контейнера, а не вокруг двух
+        # отдельных контролов — как у единого поисковика.
+        self.search_box = QFrame()
+        self.search_box.setObjectName("searchBox")
+        self.search_box.setStyleSheet("""
+            QFrame#searchBox {
+                border: 1px solid palette(mid);
+                border-radius: 6px;
+                background: palette(base);
+            }
+            QComboBox#searchFieldSelector {
+                border: none;
+                background: transparent;
+                padding: 3px 21px 3px 6px;
+            }
+            QComboBox#searchFieldSelector::drop-down {
+                border: none;
+                width: 18px;
+            }
+            QLineEdit#searchInput {
+                border: none;
+                border-radius: 0;
+                background: transparent;
+                padding: 4px 5px;
+            }
+        """)
+        search_box_layout = QHBoxLayout(self.search_box)
+        search_box_layout.setContentsMargins(5, 1, 5, 1)
+        search_box_layout.setSpacing(4)
+
+        self.search_field_selector = QComboBox()
+        self.search_field_selector.setObjectName("searchFieldSelector")
+        self.search_field_selector.setToolTip("Выберите столбец таблицы для поиска")
+        self.search_field_selector.currentIndexChanged.connect(self.change_search_field)
+        self.search_field_selector.currentTextChanged.connect(self.resize_search_field_selector)
+        self.search_field_selector.setFixedWidth(110)
+        self.search_input = QLineEdit()
+        self.search_input.setObjectName("searchInput")
+        self.search_input.setPlaceholderText("Искать в текущей таблице…")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textChanged.connect(self.change_search_text)
+
+        search_separator = QFrame()
+        search_separator.setFrameShape(QFrame.Shape.VLine)
+        search_separator.setStyleSheet("color: palette(mid);")
+        search_box_layout.addWidget(self.search_field_selector)
+        search_box_layout.addWidget(search_separator)
+        search_box_layout.addWidget(self.search_input, 1)
+
+        self.shared_summary = QLabel()
+        self.shared_summary.setWordWrap(True)
+        self.shared_summary.setMaximumWidth(360)
+        self.shared_summary.setToolTip("Этот фильтр действует во всех вкладках и аналитических отчётах")
+        search_row.addWidget(self.search_field_label)
+        search_row.addWidget(self.search_box, 2)
+        search_row.addWidget(self.shared_summary, 1)
+        central_layout.addLayout(search_row)
         central_layout.addWidget(self.tabs, 1)
         self.setCentralWidget(central)
         self.shared_filters.changed.connect(self.shared_filter_changed)
         self.shared_filter_changed()
         for page in self.pages.values():
             page.open_unified_filter = self.open_shared_filter
+            page.search_edit.textChanged.connect(
+                lambda _text, current_page=page: self.sync_search_if_current(current_page))
+            page.search_field.currentIndexChanged.connect(
+                lambda _index, current_page=page: self.sync_search_if_current(current_page))
         self.pages["nir"].before_nir_change = self.save_financing_if_dirty
         self.pages["nir"].reload_after_nir_change = self.reload_database_views
         self.pages["financing"].after_table_save = self.reload_database_views
@@ -779,8 +815,60 @@ class MainWindow(QMainWindow):
         dialog.exec()
         dialog.deleteLater()
 
-    def open_current_search(self):
-        self.tabs.currentWidget().open_search()
+    def sync_search_if_current(self, page):
+        if self.tabs.currentWidget() is page:
+            self.sync_search_controls()
+
+    def sync_search_controls(self):
+        # Поиск текущей вкладки показываем в одной строке; при переключении
+        # вкладок отдельные запросы сохраняются, как и раньше.
+        page = self.tabs.currentWidget()
+        for widget in (self.search_field_selector, self.search_input):
+            widget.blockSignals(True)
+        try:
+            self.search_field_selector.clear()
+            for index in range(page.search_field.count()):
+                self.search_field_selector.addItem(
+                    page.search_field.itemText(index), page.search_field.itemData(index))
+            self.search_field_selector.setCurrentIndex(
+                self.search_field_selector.findData(page.search_field.currentData()))
+            self.search_input.setText(page.search_edit.text())
+            self.search_input.setPlaceholderText(f"Искать в таблице «{TABLE_CONFIG[page.table_name]['title']}»…")
+        finally:
+            for widget in (self.search_field_selector, self.search_input):
+                widget.blockSignals(False)
+        self.resize_search_field_selector()
+
+    def resize_search_field_selector(self, *_):
+        # Короткий "Код вуза" не должен занимать столько же места, сколько
+        # длинные наименования столбцов. Для длинных значений есть ограничение.
+        current_text = self.search_field_selector.currentText()
+        text_width = self.search_field_selector.fontMetrics().horizontalAdvance(current_text)
+        self.search_field_selector.setFixedWidth(max(95, min(235, text_width + 43)))
+        self.search_field_selector.setToolTip(current_text or "Выберите столбец для поиска")
+
+    def change_search_field(self, _index):
+        page = self.tabs.currentWidget()
+        index = page.search_field.findData(self.search_field_selector.currentData())
+        if index >= 0:
+            page.search_field.setCurrentIndex(index)
+
+    def change_search_text(self, text):
+        self.tabs.currentWidget().search_edit.setText(text)
+
+    def sort_current_nir(self, _index):
+        if self.tabs.currentWidget() is not self.pages["nir"]:
+            return
+        page = self.pages["nir"]
+        option = self.sort_combo.currentData()
+        if option in ("university_asc", "university_desc"):
+            order = (Qt.SortOrder.DescendingOrder if option == "university_desc"
+                     else Qt.SortOrder.AscendingOrder)
+            page.apply_sort(order)
+        elif option == "number_asc":
+            page.view.sortByColumn(page.field_names.index("rnw"), Qt.SortOrder.AscendingOrder)
+        elif option == "title_asc":
+            page.view.sortByColumn(page.field_names.index("f2"), Qt.SortOrder.AscendingOrder)
 
     def shared_filter_changed(self):
         self.shared_summary.setText(self.shared_filters.describe())
@@ -793,11 +881,12 @@ class MainWindow(QMainWindow):
         if not self.save_financing_if_dirty():
             return
         filename, _ = QFileDialog.getSaveFileName(
-            self, "Выгрузить все НИР", "Все_НИР.xlsx", "Книга Excel (*.xlsx)")
+            self, "Выгрузить все НИР", dated_excel_filename("Все_НИР.xlsx"), "Книга Excel (*.xlsx)")
         if not filename:
             return
-        if not filename.lower().endswith(".xlsx"):
-            filename += ".xlsx"
+        filename = dated_excel_filename(filename)
+        if not self.confirm_dated_overwrite(filename):
+            return
         try:
             count = write_all_nir_excel(filename, db_path=self.path)
         except (OSError, sqlite3.Error, ValueError) as exc:
@@ -806,10 +895,24 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Экспорт завершён",
                                 f"В Excel сохранено {count} НИР. Активные фильтры не применялись.\n{filename}")
 
+    def confirm_dated_overwrite(self, filename):
+        if not Path(filename).exists():
+            return True
+        return QMessageBox.question(
+            self, "Перезаписать Excel-файл?",
+            f"Файл уже существует:\n{filename}\n\nПерезаписать его?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes
+
     def update_current_table(self, *_):
         for name, page in self.pages.items():
             current = self.tabs.currentWidget() is page
             self.data_actions[name].setChecked(current)
+        is_nir = self.tabs.currentWidget() is self.pages["nir"]
+        self.sort_label.setVisible(is_nir)
+        self.sort_combo.setVisible(is_nir)
+        self.sync_search_controls()
 
     def save_all(self):
         failed = []
@@ -955,10 +1058,10 @@ class MainWindow(QMainWindow):
             "• НИР добавляются и изменяются через формы; удаление требует подтверждения.\n"
             "• Рег. номер уникален внутри вуза; 07 и 7 — разные значения.\n"
             "• ГРНТИ вводится по маске, второй код необязателен.\n"
-            "• По умолчанию сортировка: код вуза + рег. номер (как текст).\n"
-            "• Один общий географический и тематический фильтр действует на все таблицы и отчёты.\n"
+            "• Сортировка НИР находится наверху, рядом с фильтром.\n"
+            "• Кнопка «Фильтр» задаёт единый географический и тематический фильтр для всех таблиц и отчётов.\n"
             "• Если сохранённая НИР скрыта фильтром, фильтр сбрасывается.\n"
-            "• Поиск текущей таблицы открывается кнопкой 🔍 наверху.\n"
+            "• Поиск — строка над таблицами: сначала выберите поле, затем введите текст.\n"
             "• Рег. номер вводится вручную; формат имени руководителя свободный, должность обязательна.\n"
             "• Журнал изменений и пересчёт доступны в меню «Опции».\n"
             "• Меню «Анализ» открывает четыре отчёта с общим фильтром и экспортом в Excel.\n"

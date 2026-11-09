@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
 
 from analysis_reports import REPORTS, FINANCING_GROUPS, build_report
 from geography_filters import GEOGRAPHY_FIELDS, populate_geography
+from export_filename import dated_excel_filename
 
 
 class ReportModel(QAbstractTableModel):
@@ -199,7 +200,7 @@ class AnalysisDialog(QDialog):
         self.filter_summary.setWordWrap(True)
         layout.addWidget(self.filter_summary)
         controls = QHBoxLayout()
-        self.filter_button, self.refresh_button = QPushButton("Общий фильтр"), QPushButton("Обновить")
+        self.filter_button, self.refresh_button = QPushButton("Фильтр"), QPushButton("Обновить")
         self.export_button = QPushButton("Сохранить в Excel")
         self.close_button = QPushButton("Закрыть")
         self.filter_button.clicked.connect(self.open_filter)
@@ -228,13 +229,21 @@ class AnalysisDialog(QDialog):
         """Экспорт только результатов текущего отчёта, без изменений БД."""
         if self.result is None:
             return
-        suggested = "Отчёт_" + self.kind + ".xlsx"
+        suggested = dated_excel_filename("Отчёт_" + self.kind + ".xlsx")
         filename, _ = QFileDialog.getSaveFileName(self, "Сохранить аналитический отчёт",
                                                    suggested, "Excel (*.xlsx)")
         if not filename:
             return
-        if not filename.lower().endswith(".xlsx"):
-            filename += ".xlsx"
+        filename = dated_excel_filename(filename)
+        if Path(filename).exists():
+            reply = QMessageBox.question(
+                self, "Перезаписать Excel-файл?",
+                f"Файл уже существует:\n{filename}\n\nПерезаписать его?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         try:
             from report_export import write_excel_report
             write_excel_report(filename, self.config["title"], self.config["columns"],
@@ -293,7 +302,7 @@ class AnalysisDialog(QDialog):
         description = (self.shared_filters.describe() if self.shared_filters is not None
                        else " · ".join(f"{dict(GEOGRAPHY_FIELDS)[field]}: {value}"
                                        for field, value in self.geography.items() if value is not None))
-        status = f"Общий фильтр: {description}" if description and description != "Без фильтра" else "Без фильтра"
+        status = f"Фильтр: {description}" if description and description != "Без фильтра" else "Без фильтра"
         self.filter_summary.setText(f"{status} · {units}: {len(result.rows)} · НИР в выборке: {result.source_count}")
         self.sync_timer.start(0)
         return True

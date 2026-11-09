@@ -39,7 +39,7 @@ class UnifiedFilterDialog(QDialog):
     def __init__(self, state: SharedFilters, parent=None):
         super().__init__(parent)
         self.state = state
-        self.setWindowTitle("Общий фильтр — все таблицы и отчёты")
+        self.setWindowTitle("Фильтр — все таблицы и отчёты")
         self.resize(660, 420)
         layout = QVBoxLayout(self)
         group = QGroupBox("География")
