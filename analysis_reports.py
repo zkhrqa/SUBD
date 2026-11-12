@@ -44,7 +44,18 @@ class ReportResult:
     source_count: int
 
 
-def build_report(kind: str, geography: dict | None = None, *, path: Path = DB_PATH) -> ReportResult:
+def rubric_condition(field: str, code: str) -> str:
+    # В старых записях коды могли разделяться запятой, пробелом или табуляцией.
+    value = f"trim(replace(replace({field}, char(9), ' '), ',', ';'))"
+    second = f"""CASE WHEN instr({value}, ';') > 0
+        THEN substr(trim(substr({value}, instr({value}, ';')+1)),1,2)
+        WHEN instr({value}, ' ') > 0
+        THEN substr(trim(substr({value}, instr({value}, ' ')+1)),1,2) END"""
+    return f"(substr({value},1,2) = {code} OR ({second}) = {code})"
+
+
+def build_report(kind: str, geography: dict | None = None, *, rubric: str | None = None,
+                 path: Path = DB_PATH) -> ReportResult:
     if kind not in REPORTS:
         raise ValueError("Неизвестный аналитический отчёт.")
     geography = geography or {}
@@ -55,6 +66,9 @@ def build_report(kind: str, geography: dict | None = None, *, path: Path = DB_PA
         if geography.get(field) is not None:
             conditions.append(f"v.{field} = ?")
             parameters.append(geography[field])
+    if rubric is not None:
+        conditions.append(rubric_condition("n.f10", "?"))
+        parameters.extend((rubric, rubric))
     where = " WHERE " + " AND ".join(conditions) if conditions else ""
     source = "FROM nir n LEFT JOIN vuz v ON v.codvuz=n.codvuz" + where
 

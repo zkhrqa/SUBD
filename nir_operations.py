@@ -3,9 +3,14 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 
-from database import DB_PATH, _normalize_rnw, _open_sqlite, ensure_financing_view, rebuild_financing
+from database import (
+    DB_PATH, FUNDING_LOCK_MESSAGE, _normalize_rnw, _open_sqlite, ensure_financing_view,
+    funding_started, rebuild_financing, rnw_comparison_key,
+)
+from funding_operations import prepare_funding
 
 FIELDS = ("codvuz", "rnw", "f1", "z2", "f6", "f10", "f2", "f7", "f18")
 GRNTI_PATTERN = re.compile(r"[0-9]{2}\.[0-9]{2}\.[0-9]{2}")
@@ -34,7 +39,7 @@ def duplicate_number_plan(conn: sqlite3.Connection) -> list[tuple[int, int | Non
     maxima = {}
     used = set()
     for _, codvuz, number in rows:
-        used.add((codvuz, number))
+        used.add((codvuz, rnw_comparison_key(number)))
         match = re.fullmatch(r"(.*?)([0-9]+)", number)
         if match:
             prefix, suffix = match.groups()
@@ -52,11 +57,11 @@ def duplicate_number_plan(conn: sqlite3.Connection) -> list[tuple[int, int | Non
         key = (codvuz, prefix)
         next_number = maxima.get(key, 0) + 1
         replacement = prefix + str(next_number).zfill(len(suffix))
-        while (codvuz, replacement) in used:
+        while (codvuz, rnw_comparison_key(replacement)) in used:
             next_number += 1
             replacement = prefix + str(next_number).zfill(len(suffix))
         maxima[key] = next_number
-        used.add((codvuz, replacement))
+        used.add((codvuz, rnw_comparison_key(replacement)))
         changes.append((row_id, codvuz, number, replacement))
     return changes
 
@@ -165,7 +170,40 @@ def prepare_database(path: Path = DB_PATH) -> Path:
     finally:
         conn.close()
     enforce_nir_unique_key(path)
+    with closing(_open_sqlite(path)) as conn:
+        install_number_checks(conn)
+        prepare_funding(conn)
     return backup
+
+
+def install_number_checks(conn: sqlite3.Connection) -> None:
+    def key(field):
+        # SQLite получает нормализованные номера из формы. Сравниваем и номера
+        # из внешнего SQL, в том числе с обычными пробелами и табуляцией.
+        value = f"replace(replace({field}, ' ', ''), char(9), '')"
+        return (f"CASE WHEN {value} <> '' AND {value} NOT GLOB '*[^0-9]*' "
+                f"THEN COALESCE(NULLIF(ltrim({value}, '0'), ''), '0') ELSE {value} END")
+
+    same_number = f"codvuz IS NEW.codvuz AND ({key('rnw')}) = ({key('NEW.rnw')})"
+    conn.executescript(f"""
+        CREATE TRIGGER IF NOT EXISTS nir_compare_insert
+        BEFORE INSERT ON nir
+        WHEN EXISTS (SELECT 1 FROM nir WHERE {same_number})
+        BEGIN SELECT RAISE(ABORT, 'Рег. номер уже существует в выбранном вузе.'); END;
+
+        CREATE TRIGGER IF NOT EXISTS nir_compare_update
+        BEFORE UPDATE OF codvuz, rnw ON nir
+        WHEN (OLD.codvuz IS NOT NEW.codvuz OR ({key('OLD.rnw')}) IS NOT ({key('NEW.rnw')}))
+             AND EXISTS (SELECT 1 FROM nir WHERE id != OLD.id AND {same_number})
+        BEGIN SELECT RAISE(ABORT, 'Рег. номер уже существует в выбранном вузе.'); END;
+    """)
+
+
+def number_in_use(conn, codvuz, number, row_id):
+    key = rnw_comparison_key(number)
+    return any(rnw_comparison_key(row[0]) == key for row in conn.execute(
+        "SELECT rnw FROM nir WHERE codvuz IS ? AND id != ?", (codvuz, row_id or -1)
+    ))
 
 
 def normalize_grnti_input(text: str) -> str:
@@ -188,11 +226,9 @@ def validate_values(conn: sqlite3.Connection, values: dict, row_id: int | None =
     if not result["rnw"]:
         raise ValueError("Введите регистрационный номер.")
     old = conn.execute("SELECT codvuz,rnw FROM nir WHERE id=?", (row_id,)).fetchone()
-    same_key = old and tuple(old) == (result["codvuz"], result["rnw"])
-    if not same_key and conn.execute(
-        "SELECT 1 FROM nir WHERE codvuz=? AND rnw=? AND id != ?",
-        (result["codvuz"], result["rnw"], row_id or -1),
-    ).fetchone():
+    same_key = (old and old[0] == result["codvuz"]
+                and rnw_comparison_key(old[1]) == rnw_comparison_key(result["rnw"]))
+    if not same_key and number_in_use(conn, result["codvuz"], result["rnw"], row_id):
         raise ValueError("Такой рег. номер уже есть у выбранного вуза.")
     if result["f1"] not in {"Ф", "П", "Р"}:
         raise ValueError("Выберите характер НИР: Ф, П или Р.")
@@ -225,6 +261,8 @@ def save_nir(values: dict, row_id: int | None = None, *, path: Path = DB_PATH,
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if funding_started(conn):
+            raise ValueError(FUNDING_LOCK_MESSAGE)
         if row_id is not None:
             current = conn.execute("SELECT * FROM nir WHERE id=?", (row_id,)).fetchone()
             if current is None:
@@ -256,6 +294,8 @@ def delete_nir(row_id: int, *, path: Path = DB_PATH, expected: dict | None = Non
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if funding_started(conn):
+            raise ValueError(FUNDING_LOCK_MESSAGE)
         row = conn.execute("SELECT * FROM nir WHERE id=?", (row_id,)).fetchone()
         if row is None:
             raise ValueError("Запись уже удалена. Обновите таблицу.")
@@ -282,6 +322,8 @@ def repair_vuz_links(assignments: dict[int, int], *, expected: dict[int, dict],
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if funding_started(conn):
+            raise ValueError(FUNDING_LOCK_MESSAGE)
         for row_id, codvuz in assignments.items():
             row = conn.execute("SELECT * FROM nir WHERE id=?", (row_id,)).fetchone()
             if row is None or dict(row) != expected[row_id]:
@@ -291,6 +333,8 @@ def repair_vuz_links(assignments: dict[int, int], *, expected: dict[int, dict],
                 raise ValueError("Назначенный вуз отсутствует в справочнике.")
             if row["codvuz"] == codvuz and row["z2"] == vuz[0]:
                 continue
+            if row["codvuz"] != codvuz and number_in_use(conn, codvuz, row["rnw"], row_id):
+                raise sqlite3.IntegrityError("Рег. номер уже существует в выбранном вузе.")
             conn.execute("UPDATE nir SET codvuz=?,z2=? WHERE id=?", (codvuz, vuz[0], row_id))
             conn.execute("""UPDATE change_log SET reason=? WHERE id=(
                 SELECT MAX(id) FROM change_log
@@ -309,6 +353,8 @@ def save_actual_financing(changes: list[tuple[int, int]], *, path: Path = DB_PAT
     conn = _open_sqlite(path)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if funding_started(conn):
+            raise ValueError("Факт финансирования обновляется при утверждении распоряжения.")
         for codvuz, amount in changes:
             if not isinstance(amount, int) or not 0 <= amount <= 9223372036854775807:
                 raise ValueError("Фактическое финансирование — целое неотрицательное число рублей.")

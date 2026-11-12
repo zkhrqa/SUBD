@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import re
+from contextlib import closing
 import sqlite3
 import sys
 from pathlib import Path
@@ -28,12 +28,13 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from database import DB_PATH, create_database, rebuild_financing, run_validation
-from nir_operations import delete_nir, prepare_database, read_rows, save_actual_financing
+from database import DB_PATH, FUNDING_LOCK_MESSAGE, create_database, funding_started, rebuild_financing, run_validation
+from nir_operations import delete_nir, prepare_database, read_rows
 from nir_forms import ChangeLogDialog, NirDialog
-from geography_filters import populate_geography
+from geography_filters import GEOGRAPHY_FIELDS, populate_geography
 from analysis_forms import AnalysisDialog
-from analysis_reports import REPORTS
+from analysis_reports import REPORTS, rubric_condition
+from funding_forms import FundingDialog
 
 
 TABLE_CONFIG = {
@@ -51,8 +52,6 @@ TABLE_CONFIG = {
             "f7": "Должность руководителя",
             "f18": "Плановое финансирование, руб.",
         },
-        "editable": set(),
-        "hint": "Для редактирования НИР используйте кнопки снизу. Рег. номер уникален внутри вуза; ГРНТИ — один или два кода через ';'.",
     },
     "financing": {
         "title": "Финансирование вузов",
@@ -63,8 +62,6 @@ TABLE_CONFIG = {
             "z18": "Факт, руб.",
             "numworks": "Количество НИР",
         },
-        "editable": {"z18"},
-        "hint": "План и количество НИР рассчитываются автоматически. НИР без связи с вузом показаны строкой «Вуз не определён». Факт редактируется только для определённых вузов.",
     },
     "vuz": {
         "title": "Справочник вузов",
@@ -81,27 +78,21 @@ TABLE_CONFIG = {
             "gr_ved": "Группа ведомств",
             "prof": "Профиль",
         },
-        "editable": set(),
-        "hint": "VUZ — справочник: только просмотр. Изменение из интерфейса ЛР №1 запрещено.",
     },
     "grnti": {
         "title": "Рубрики ГРНТИ",
         "headers": {"codrub": "Код рубрики", "rubrika": "Наименование рубрики"},
-        "editable": set(),
-        "hint": "Справочник рубрик используется для автоматической проверки и анализа кодов ГРНТИ.",
     },
 }
 
 
 class ControlledTableModel(QSqlTableModel):
-    """QSqlTableModel, в котором редактируются только разрешенные поля."""
+    """Таблицы для просмотра. Изменения НИР проходят через формы."""
 
-    def __init__(self, editable_fields: set[str], parent=None, db=QSqlDatabase()):
+    def __init__(self, parent=None, db=QSqlDatabase()):
         super().__init__(parent, db)
-        self.editable_fields = editable_fields
         self.key_sort = False
         self.key_order = Qt.SortOrder.AscendingOrder
-        self.save_pending = self.submitAll
         self.unassigned_financing = False
 
     def is_unassigned_row(self, index):
@@ -133,43 +124,15 @@ class ControlledTableModel(QSqlTableModel):
         return super().orderByClause()
 
     def sort(self, column, order=Qt.SortOrder.AscendingOrder):
-        if self.isDirty() and not self.save_pending():
-            QMessageBox.warning(None, "Сортировка не выполнена", self.lastError().text())
-            return
         self.key_sort = False
         super().sort(column, order)
 
     def flags(self, index):
-        flags = super().flags(index)
-        if not index.isValid():
-            return flags
-        field = self.record().fieldName(index.column())
-        if field not in self.editable_fields or self.is_unassigned_row(index):
-            return flags & ~Qt.ItemFlag.ItemIsEditable
-        return flags | Qt.ItemFlag.ItemIsEditable
+        return super().flags(index) & ~Qt.ItemFlag.ItemIsEditable
 
     def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
-        if role == Qt.ItemDataRole.EditRole and index.isValid():
-            if self.is_unassigned_row(index):
-                return False
-            field = self.record().fieldName(index.column())
-            text = str(value).strip() if value is not None else ""
-            if field == "rnw":
-                value = "".join(text.split())
-            elif field == "f10":
-                value = "; ".join(p.strip() for p in text.replace(",", ";").split(";") if p.strip())
-            elif field in {"f18", "z18"}:
-                if not re.fullmatch(r"[0-9]+", text) or int(text) > 9223372036854775807:
-                    QMessageBox.warning(None, "Некорректное значение", "Сумма должна быть целым неотрицательным числом рублей.")
-                    return False
-                value = int(text)
-            elif field == "f1":
-                value = text.upper()
-                if value not in {"Ф", "П", "Р"}:
-                    QMessageBox.warning(None, "Некорректное значение", "Характер НИР: только Ф, П или Р.")
-                    return False
-            else:
-                value = text
+        if role == Qt.ItemDataRole.EditRole:
+            return False
         return super().setData(index, value, role)
 
 
@@ -180,17 +143,13 @@ class TablePage(QWidget):
         super().__init__(parent)
         self.table_name = table_name
         self.path = Path(db.databaseName())
-        self.before_nir_change = None
+        self.nir_locked = False
         self.reload_after_nir_change = None
-        self.after_table_save = None
-        self.last_save_error = ""
         cfg = TABLE_CONFIG[table_name]
 
-        self.model = ControlledTableModel(cfg["editable"], self, db)
+        self.model = ControlledTableModel(self, db)
         self.model.unassigned_financing = table_name == "financing"
         self.model.setTable("financing_display" if table_name == "financing" else table_name)
-        self.model.setEditStrategy(QSqlTableModel.EditStrategy.OnManualSubmit)
-        self.model.save_pending = self.save
         self.model.select()
 
         self.field_names: list[str] = []
@@ -213,7 +172,6 @@ class TablePage(QWidget):
             header = self.view.horizontalHeader()
             for position, field in enumerate(("f18", "f7", "f2"), start=len(self.field_names) - 3):
                 header.moveSection(header.visualIndex(self.field_names.index(field)), position)
-            self.view.doubleClicked.connect(lambda _: self.edit_nir())
         elif table_name == "vuz":
             header = self.view.horizontalHeader()
             order = ("codvuz", "z2", "city", "oblname", "region", "status", "obl", "gr_ved", "prof", "z1", "z1full")
@@ -264,17 +222,13 @@ class TablePage(QWidget):
         self.filter_dialog.setWindowTitle(f"Фильтр — {cfg['title']}")
         self.filter_dialog.resize(650, 380 if table_name == "nir" else 290)
         filter_layout = QVBoxLayout(self.filter_dialog)
-        hint = QLabel(cfg["hint"])
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #555; padding: 4px 0;")
 
         layout = QVBoxLayout(self)
-        layout.addWidget(hint)
         self.geography: dict[str, QComboBox] = {}
         if table_name in {"nir", "financing", "vuz"}:
             geography_group = QGroupBox("География")
             geography_layout = QFormLayout(geography_group)
-            for field, label in (("region", "Округ"), ("oblname", "Субъект РФ"), ("city", "Город"), ("codvuz", "Вуз")):
+            for field, label in GEOGRAPHY_FIELDS:
                 combo = QComboBox()
                 combo.addItem("Все", None)
                 combo.setMinimumContentsLength(12)
@@ -486,10 +440,6 @@ class TablePage(QWidget):
         return "'" + str(text).replace("'", "''") + "'"
 
     def apply_filter(self, *_):
-        # Не теряем несохранённый факт финансирования при смене фильтра.
-        if self.model.isDirty() and not self.save():
-            QMessageBox.warning(self, "Фильтр не применён", self.last_save_error)
-            return False
         field = self.search_field.currentData()
         text = self.search_edit.text().strip()
         conditions = []
@@ -511,15 +461,7 @@ class TablePage(QWidget):
             where = " AND ".join(geo)
             conditions.append(f"codvuz IN (SELECT codvuz FROM vuz WHERE {where})")
         if hasattr(self, "rubric") and self.rubric.currentData() is not None:
-            code = self.sql_text(self.rubric.currentData())
-            first = f"substr(trim(f10),1,2) = {code}"
-            # Учитываем старые записи с запятой или пробелом между кодами.
-            second = f"""(CASE
-                WHEN instr(f10,';')>0 THEN substr(trim(substr(f10,instr(f10,';')+1)),1,2)
-                WHEN instr(f10,',')>0 THEN substr(trim(substr(f10,instr(f10,',')+1)),1,2)
-                WHEN instr(trim(f10),' ')>0 THEN substr(trim(substr(trim(f10),instr(trim(f10),' ')+1)),1,2)
-                ELSE '' END) = {code}"""
-            conditions.append(f"({first} OR {second})")
+            conditions.append(rubric_condition("f10", self.sql_text(self.rubric.currentData())))
         self.model.setFilter(" AND ".join(conditions))
         selected = self.model.select()
         self.update_filter_summary()
@@ -549,8 +491,9 @@ class TablePage(QWidget):
 
     def update_buttons(self, *_):
         selected = self.view.currentIndex().isValid()
-        self.edit_button.setEnabled(selected)
-        self.delete_button.setEnabled(selected)
+        self.add_button.setEnabled(not self.nir_locked)
+        self.edit_button.setEnabled(selected and not self.nir_locked)
+        self.delete_button.setEnabled(selected and not self.nir_locked)
 
     def selected_record(self) -> dict | None:
         index = self.view.currentIndex()
@@ -562,7 +505,10 @@ class TablePage(QWidget):
         return rows[0] if rows else None
 
     def ready_for_nir_change(self) -> bool:
-        return self.before_nir_change is None or self.before_nir_change()
+        if self.nir_locked:
+            QMessageBox.warning(self, "Изменения НИР заблокированы", FUNDING_LOCK_MESSAGE)
+            return False
+        return True
 
     def add_nir(self):
         if not self.ready_for_nir_change():
@@ -625,29 +571,6 @@ class TablePage(QWidget):
             QMessageBox.information(self, "Фильтр сброшен", "Запись сохранена. Фильтр сброшен, чтобы показать её в таблице.")
         self.nir_changed.emit(row_id)
 
-    def save(self) -> bool:
-        self.last_save_error = ""
-        if self.table_name == "financing" and self.model.isDirty():
-            column = self.field_names.index("z18")
-            changes = [
-                (self.model.record(row).value("codvuz"), self.model.record(row).value("z18"))
-                for row in range(self.model.rowCount()) if self.model.isDirty(self.model.index(row, column))
-            ]
-            try:
-                save_actual_financing(changes, path=self.path)
-            except (ValueError, sqlite3.Error) as exc:
-                self.last_save_error = str(exc)
-                return False
-            self.model.revertAll()
-            if self.after_table_save is not None:
-                self.after_table_save()
-            return True
-        return self.model.submitAll()
-
-    def revert(self):
-        self.model.revertAll()
-        self.model.select()
-
     def refresh(self):
         self.apply_filter()
         self.view.resizeColumnsToContents()
@@ -661,7 +584,6 @@ class MainWindow(QMainWindow):
         self.resize(1450, 820)
 
         self.path = path
-        self.analysis_windows = {}
         self.db = self.connect_db(path)
         self.table_stack = QStackedWidget()
         self.pages: dict[str, TablePage] = {}
@@ -670,16 +592,15 @@ class MainWindow(QMainWindow):
             self.pages[name] = page
             self.table_stack.addWidget(page)
         self.setCentralWidget(self.table_stack)
-        self.pages["nir"].before_nir_change = self.save_financing_if_dirty
         self.pages["nir"].reload_after_nir_change = self.reload_database_views
-        self.pages["financing"].after_table_save = self.reload_database_views
         self.pages["nir"].nir_changed.connect(self.on_nir_changed)
 
         self.build_menu()
+        self.update_funding_lock()
         self.statusBar().showMessage("Готово")
 
         # Автоматическая проверка — по замечанию преподавателя.
-        self.auto_check(show_dialog=False)
+        self.auto_check()
 
     @staticmethod
     def connect_db(path: Path) -> QSqlDatabase:
@@ -717,9 +638,7 @@ class MainWindow(QMainWindow):
         self.configure_db(self.db)
         for page in self.pages.values():
             page.refresh()
-        for dialog in self.analysis_windows.values():
-            if dialog.isVisible():
-                dialog.reload()
+        self.update_funding_lock()
 
     def build_menu(self):
         # На macOS меню всегда остаётся в хеддере самого окна.
@@ -744,26 +663,15 @@ class MainWindow(QMainWindow):
             action.triggered.connect(lambda checked=False, name=kind: self.open_analysis(name))
             self.analysis_actions[kind] = action
 
+        menu_funding = bar.addMenu("Финансирование")
+        menu_funding.addAction("Распределение траншей").triggered.connect(self.open_funding)
+
         menu_options = bar.addMenu("Опции")
-        a_save = menu_options.addAction("Сохранить изменения")
-        a_save.setShortcut("Ctrl+S")
-        a_save.triggered.connect(self.save_all)
-        a_revert = menu_options.addAction("Отменить несохраненные изменения")
-        a_revert.triggered.connect(self.revert_all)
-        menu_options.addSeparator()
-        a_recalc = menu_options.addAction("Пересчитать финансирование")
-        a_recalc.triggered.connect(self.recalculate_financing)
-        a_check = menu_options.addAction("Автоматическая проверка данных")
-        a_check.triggered.connect(lambda: self.auto_check(show_dialog=True))
-        menu_options.addSeparator()
-        a_edit = menu_options.addAction("Редактировать НИР")
-        a_edit.triggered.connect(self.edit_nir)
+        self.recalculate_action = menu_options.addAction("Пересчитать финансирование")
+        self.recalculate_action.triggered.connect(lambda: self.recalculate_financing())
         a_log = menu_options.addAction("Журнал изменений")
         a_log.triggered.connect(self.show_change_log)
 
-        menu_help = bar.addMenu("Помощь")
-        menu_help.addAction("Справка").triggered.connect(self.show_help)
-        menu_help.addAction("О программе").triggered.connect(self.show_about)
         bar.addAction("Выход").triggered.connect(self.close)
         self.table_stack.currentChanged.connect(self.update_current_table)
         self.update_current_table()
@@ -773,73 +681,50 @@ class MainWindow(QMainWindow):
             current = self.table_stack.currentWidget() is page
             self.data_actions[name].setChecked(current)
 
-    def save_all(self):
-        failed = []
-        for name, page in self.pages.items():
-            if TABLE_CONFIG[name]["editable"] and not page.save():
-                failed.append(name)
-        if failed:
-            QMessageBox.critical(self, "Ошибка сохранения", "Не удалось сохранить: " + ", ".join(failed))
-            return False
-        if not self.recalculate_financing(show_message=False):
-            return False
-        self.auto_check(show_dialog=False)
-        self.statusBar().showMessage("Изменения сохранены, финансирование пересчитано, проверка выполнена.", 7000)
-        return True
+    def update_funding_lock(self):
+        with closing(sqlite3.connect(self.path, timeout=30)) as conn:
+            locked = funding_started(conn)
+        page = self.pages["nir"]
+        page.nir_locked = locked
+        page.update_buttons()
+        self.recalculate_action.setEnabled(not locked)
+        if locked:
+            page.add_button.setToolTip(FUNDING_LOCK_MESSAGE)
+            page.edit_button.setToolTip(FUNDING_LOCK_MESSAGE)
+            page.delete_button.setToolTip(FUNDING_LOCK_MESSAGE)
 
-    def save_financing_if_dirty(self):
-        page = self.pages["financing"]
-        if page.model.isDirty() and not page.save():
-            QMessageBox.warning(self, "Ошибка сохранения финансирования", page.last_save_error)
-            return False
-        return True
+    def open_funding(self):
+        try:
+            dialog = FundingDialog(self.path, self)
+        except sqlite3.Error as exc:
+            QMessageBox.warning(self, "Финансирование не открыто", str(exc))
+            return
+        dialog.exec()
+        if dialog.has_approved:
+            self.reload_database_views()
+        else:
+            self.update_funding_lock()
+        dialog.deleteLater()
 
     def on_nir_changed(self, _row_id):
-        self.auto_check(show_dialog=False)
-
-    def edit_nir(self):
-        self.table_stack.setCurrentWidget(self.pages["nir"])
-        if not self.pages["nir"].view.currentIndex().isValid():
-            QMessageBox.information(self, "Редактировать НИР", "Выберите НИР в таблице и нажмите «Изменить».")
-            return
-        self.pages["nir"].edit_nir()
+        self.auto_check()
 
     def show_change_log(self):
         ChangeLogDialog(self.path, self).exec()
 
-    def revert_all(self):
-        for page in self.pages.values():
-            page.revert()
-        self.statusBar().showMessage("Несохраненные изменения отменены.", 5000)
-
-    def recalculate_financing(self, show_message=True):
-        # WAL + busy_timeout позволяют безопасно пересчитывать таблицу через
-        # отдельное sqlite3-соединение при открытом интерфейсе Qt.
+    def recalculate_financing(self):
         try:
-            if not self.save_financing_if_dirty():
-                return False
-            conn = sqlite3.connect(self.path, timeout=30)
-            try:
+            with closing(sqlite3.connect(self.path, timeout=30)) as conn, conn:
                 rebuild_financing(conn)
-                conn.commit()
-            finally:
-                conn.close()
-        except sqlite3.OperationalError as exc:
-            QMessageBox.critical(
-                self,
-                "Ошибка базы данных",
-                "Не удалось пересчитать финансирование.\n\n"
-                f"{exc}\n\n"
-                "Закройте вторую копию программы и программы просмотра SQLite, "
-                "если они открыты, затем повторите.",
-            )
+        except (sqlite3.Error, ValueError) as exc:
+            self.update_funding_lock()
+            QMessageBox.warning(self, "Не удалось пересчитать финансирование", str(exc))
             return False
         self.reload_database_views()
-        if show_message:
-            QMessageBox.information(self, "Пересчет", "Таблица финансирования пересчитана по текущим данным НИР.")
+        QMessageBox.information(self, "Пересчёт", "Таблица финансирования пересчитана по текущим данным НИР.")
         return True
 
-    def auto_check(self, show_dialog=True):
+    def auto_check(self):
         try:
             # В интерфейсе проверка только читает БД. Журнал уже формируется
             # при первичном создании базы; лишняя запись здесь не нужна.
@@ -849,97 +734,31 @@ class MainWindow(QMainWindow):
             finally:
                 conn.close()
         except sqlite3.OperationalError as exc:
-            if show_dialog:
-                QMessageBox.critical(self, "Ошибка проверки", str(exc))
             self.statusBar().showMessage(f"Проверка не выполнена: {exc}", 7000)
             return
         errors = sum(1 for i in issues if i[0] == "ERROR")
         warnings = sum(1 for i in issues if i[0] == "WARNING")
         self.statusBar().showMessage(f"Автопроверка: ошибок — {errors}, предупреждений — {warnings}")
-        if not show_dialog:
-            return
-        if not issues:
-            QMessageBox.information(self, "Проверка данных", "Ошибок и предупреждений не найдено.")
-            return
-        lines = [f"{sev}: {ref} — {msg}" for sev, _table, ref, msg in issues[:30]]
-        if len(issues) > 30:
-            lines.append(f"... еще {len(issues) - 30} сообщений")
-        QMessageBox.warning(
-            self,
-            "Проверка данных",
-            f"Найдено ошибок: {errors}; предупреждений: {warnings}.\n\n" + "\n".join(lines),
-        )
 
     def open_analysis(self, kind):
-        if not self.save_financing_if_dirty():
-            return
-        dialog = self.analysis_windows.get(kind)
-        if dialog is None:
-            dialog = AnalysisDialog(self.path, kind, self, before_refresh=self.save_financing_if_dirty)
-            self.analysis_windows[kind] = dialog
-        else:
-            dialog.reload()
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-
-    def show_help(self):
-        QMessageBox.information(
-            self,
-            "Справка",
-            "ЛР №1, вариант 9.\n\n"
-            "• Таблицы переключаются через выпадающее меню «Данные» внутри окна.\n"
-            "• VUZ и ГРНТИ — только просмотр.\n"
-            "• RNW сохраняется без пробелов.\n"
-            "• НИР добавляются и изменяются через формы; удаление требует подтверждения.\n"
-            "• Рег. номер уникален внутри вуза; 07 и 7 — разные значения.\n"
-            "• ГРНТИ вводится по маске, второй код необязателен.\n"
-            "• По умолчанию сортировка: код вуза + рег. номер (как текст).\n"
-            "• Есть географические фильтры и фильтр рубрик по обоим кодам ГРНТИ.\n"
-            "• Если сохранённая НИР скрыта фильтром, фильтр сбрасывается.\n"
-            "• Поиск по тексту открывается отдельно от географического фильтра.\n"
-            "• Рег. номер вводится вручную; формат имени руководителя свободный, должность обязательна.\n"
-            "• Журнал изменений и пересчёт доступны в меню «Опции».\n"
-            "• Меню «Анализ» открывает три отчёта с собственными фильтрами и кнопкой обновления.\n"
-            "• В отчётах по вузам и характеру строка «Итого» закреплена внизу.\n"
-            "• Денежные суммы хранятся целыми рублями.\n"
-            "• После сохранения выполняются пересчет финансирования и автоматическая проверка.",
-        )
-
-    def show_about(self):
-        QMessageBox.information(
-            self,
-            "О программе",
-            "Учебная оболочка информационной системы\n"
-            "«Управление научными исследованиями по тематическому плану»\n"
-            "Вариант №9, НИУ «МЭИ», 2026.",
-        )
+        nir = self.pages["nir"]
+        geography = {field: combo.currentData() for field, combo in nir.geography.items()
+                     if combo.currentData() is not None}
+        rubric = nir.rubric.currentData()
+        conditions = [f"{label} — {nir.geography[field].currentText()}"
+                      for field, label in GEOGRAPHY_FIELDS if field in geography]
+        if rubric is not None:
+            conditions.append(f"ГРНТИ — {nir.rubric.currentText()}")
+        description = "Фильтр НИР — " + " · ".join(conditions) if conditions else "Без фильтра"
+        dialog = AnalysisDialog(self.path, kind, self, geography=geography,
+                                rubric=rubric, filter_description=description)
+        if dialog.result is not None:
+            dialog.exec()
+        dialog.deleteLater()
 
     def closeEvent(self, event):
-        if not any(page.model.isDirty() for page in self.pages.values()):
-            self.db.close()
-            for dialog in self.analysis_windows.values():
-                dialog.close()
-            event.accept()
-            return
-        reply = QMessageBox.question(
-            self,
-            "Выход",
-            "Сохранить изменения перед выходом?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
-            QMessageBox.StandardButton.Yes,
-        )
-        if reply == QMessageBox.StandardButton.Cancel:
-            event.ignore()
-            return
-        if reply == QMessageBox.StandardButton.Yes:
-            if not self.save_all():
-                event.ignore()
-                return
         self.db.close()
-        for dialog in self.analysis_windows.values():
-            dialog.close()
-        event.accept()
+        super().closeEvent(event)
 
 
 def main():

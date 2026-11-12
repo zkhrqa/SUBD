@@ -7,11 +7,24 @@ GEOGRAPHY_FIELDS = (("region", "Округ"), ("oblname", "Субъект РФ")
 
 def populate_geography(combos, path, values=None, after=None):
     fields = list(combos)
-    values = values if values is not None else {f: c.currentData() for f, c in combos.items()}
-    start = fields.index(after) + 1 if after is not None else 0
+    values = dict(values) if values is not None else {f: c.currentData() for f, c in combos.items()}
+    if after is not None:
+        index = fields.index(after)
+        parents = fields[:index]
+        if values[after] is None:
+            for field in fields[index + 1:]:
+                values[field] = None
+        elif parents:
+            known = {field: values[field] for field in (*parents, after) if values.get(field) is not None}
+            where = " AND ".join(f"{field} = ?" for field in known)
+            matches = read_rows(f"SELECT DISTINCT {', '.join(parents)} FROM vuz WHERE {where}",
+                                tuple(known.values()), path=path)
+            for field in parents:
+                candidates = {row[field] for row in matches}
+                if len(candidates) == 1:
+                    values[field] = candidates.pop() or None
+
     for index, field in enumerate(fields):
-        if index < start:
-            continue
         conditions, parameters = [], []
         for parent in fields[:index]:
             value = combos[parent].currentData()

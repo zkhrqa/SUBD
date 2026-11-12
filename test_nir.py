@@ -5,20 +5,25 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6 import sip
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QStandardPaths, Qt
 from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
+from openpyxl import load_workbook
 
 from database import rebuild_financing, run_validation
 from main import MainWindow
 from nir_forms import ChangeLogDialog, NirDialog
 from analysis_forms import AnalysisDialog
 from analysis_reports import build_report
+from funding_forms import FundingDialog
+from funding_operations import approve_order, load_funding, preview_order
+from report_export import TEST_COPY_PROPERTY
 from nir_operations import delete_nir, duplicate_number_plan, enforce_nir_unique_key, repair_vuz_links, normalize_grnti_input, prepare_database, read_rows, save_actual_financing, save_nir
 
 
@@ -98,10 +103,15 @@ class NirTests(unittest.TestCase):
 
     def test_duplicates_leading_zeros_and_existing_conflicts(self):
         save_nir(self.values, path=self.path)
+        for number in ("07", "7", " 0 0 7 "):
+            with self.assertRaises(ValueError):
+                save_nir(dict(self.values, rnw=number), path=self.path)
         with self.assertRaises(ValueError):
-            save_nir(dict(self.values, rnw="07"), path=self.path)
-        save_nir(dict(self.values, rnw="7"), path=self.path)
-        save_nir(dict(self.values, codvuz=2, rnw="07"), path=self.path)
+            save_nir(dict(self.values, codvuz=2, rnw="07"), path=self.path)
+        save_nir(dict(self.values, rnw="Р-07"), path=self.path)
+        save_nir(dict(self.values, rnw="Р-7"), path=self.path)
+        with self.assertRaises(ValueError):
+            save_nir(dict(self.values, rnw="Р- 7"), path=self.path)
         with self.assertRaises(ValueError):
             save_nir(dict(self.values, rnw="018"), path=self.path)
         # При подготовке второй номер 018 уже заменён на 019.
@@ -198,6 +208,8 @@ class NirTests(unittest.TestCase):
             with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute("INSERT INTO nir(codvuz,rnw) VALUES(1,'018')")
             with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO nir(codvuz,rnw) VALUES(1,'00 18')")
+            with self.assertRaises(sqlite3.IntegrityError):
                 conn.execute("UPDATE nir SET codvuz=1,rnw='018' WHERE id=3")
 
     def test_concurrent_change_is_not_overwritten_or_deleted(self):
@@ -216,7 +228,7 @@ class NirTests(unittest.TestCase):
         self.assertEqual(len(self.rows("SELECT * FROM nir")), 3)
         self.assertEqual(self.rows("SELECT * FROM change_log"), [])
 
-    def test_form_filter_sort_selection_and_financing_journal(self):
+    def test_form_filter_sort_selection_and_read_only_financing(self):
         window = MainWindow(self.path)
         try:
             page = window.pages["nir"]
@@ -261,9 +273,7 @@ class NirTests(unittest.TestCase):
             column = financing.field_names.index("z18")
             row = next(i for i in range(financing.model.rowCount())
                        if financing.model.record(i).value("codvuz") == 1)
-            self.assertTrue(financing.model.setData(financing.model.index(row, column), "123", Qt.ItemDataRole.EditRole))
-            self.assertTrue(window.save_financing_if_dirty())
-            self.assertEqual(self.rows("SELECT table_name FROM change_log ORDER BY id DESC LIMIT 1")[0]["table_name"], "financing")
+            self.assertFalse(financing.model.setData(financing.model.index(row, column), "123", Qt.ItemDataRole.EditRole))
             # Изменение поискового поля применяет введённый фильтр заново.
             page.search_field.setCurrentIndex(page.search_field.findData("rnw"))
             page.search_edit.setText(saved_number)
@@ -459,6 +469,10 @@ class NirTests(unittest.TestCase):
         window = MainWindow(self.path)
         try:
             self.assertFalse(window.menuBar().isNativeMenuBar())
+            self.assertNotIn("Помощь", [action.text() for action in window.menuBar().actions()])
+            options = next(action.menu() for action in window.menuBar().actions() if action.text() == "Опции")
+            self.assertEqual([action.text() for action in options.actions()],
+                             ["Пересчитать финансирование", "Журнал изменений"])
             window.show()
             self.app.processEvents()
             self.assertIs(window.centralWidget(), window.table_stack)
@@ -494,6 +508,8 @@ class NirTests(unittest.TestCase):
                 return [combo.itemData(i) for i in range(1, combo.count())]
             choose('city', 'Томск')
             self.assertEqual(values('codvuz'), [2])
+            self.assertEqual(page.geography['region'].currentData(), 'Сибирский')
+            self.assertEqual(page.geography['oblname'].currentData(), 'Томская область')
             choose('codvuz', 2)
             choose('region', 'Центральный')
             self.assertIsNone(page.geography['city'].currentData())
@@ -517,7 +533,11 @@ class NirTests(unittest.TestCase):
             page.clear_filter()
             choose('codvuz', 2)
             self.assertEqual(page.model.rowCount(), 1)
-            self.assertIsNone(page.geography['region'].currentData())
+            self.assertEqual(page.geography['region'].currentData(), 'Сибирский')
+            self.assertEqual(page.geography['city'].currentData(), 'Томск')
+            choose('region', None)
+            self.assertEqual(page.model.rowCount(), 3)
+            self.assertIsNone(page.geography['codvuz'].currentData())
         finally:
             window.close()
 
@@ -692,67 +712,268 @@ class NirTests(unittest.TestCase):
         rubric = AnalysisDialog(self.path, 'grnti')
         self.assertTrue(rubric.footer.isHidden())
         self.assertEqual(rubric.footer_model.rowCount(), 0)
+        character = AnalysisDialog(self.path, 'character')
+        for report in (dialog, rubric, character):
+            report.show()
+            self.app.processEvents()
+            table = report.table
+            self.assertEqual(table.horizontalScrollBar().maximum(), 0)
+            text_width = table.columnWidth(1)
+            report.resize(report.width() + 160, report.height())
+            self.app.processEvents()
+            self.assertEqual(table.columnWidth(1), text_width)
+            if report.footer_model.rowCount():
+                for col in range(report.model.columnCount()):
+                    self.assertEqual(table.columnWidth(col), report.footer.columnWidth(col))
+        self.assertEqual(character.table.verticalScrollBar().maximum(), 0)
+        character.layout().setContentsMargins(18, 18, 18, 18)
+        character.layout().setSpacing(20)
+        character.fit_window()
+        character.resize(character.width(), 220)
+        self.app.processEvents()
+        self.assertGreaterEqual(character.table.viewport().height(), character.table.verticalHeader().length())
+        self.assertEqual(character.table.verticalScrollBar().maximum(), 0)
 
-    def test_analysis_filter_apply_cancel_reset_and_window_independence(self):
-        first = AnalysisDialog(self.path, 'vuz')
-        second = AnalysisDialog(self.path, 'character')
-        def choose_city(dialog):
-            combo = dialog.geography['city']
-            combo.setCurrentIndex(combo.findData('Томск'))
-            self.assertEqual(dialog.geography['codvuz'].count(), 2)
-            dialog.accept()
-            return dialog.result()
-        with patch('analysis_forms.GeographyDialog.exec', new=choose_city):
-            first.open_filter()
-        self.assertEqual(first.geography, {'city': 'Томск'})
-        self.assertEqual(first.result.totals['count'], 1)
-        self.assertEqual(second.geography, {})
-        self.assertEqual(second.result.totals['count'], 3)
-        def cancel_reset(dialog):
-            dialog.reset_button.click()
-            self.assertEqual(dialog.values(), {})
-            return QDialog.DialogCode.Rejected
-        with patch('analysis_forms.GeographyDialog.exec', new=cancel_reset):
-            first.open_filter()
-        self.assertEqual(first.geography, {'city': 'Томск'})
-        self.assertEqual(first.result.totals['count'], 1)
-        def apply_reset(dialog):
-            dialog.reset_button.click()
-            dialog.accept()
-            return dialog.result()
-        with patch('analysis_forms.GeographyDialog.exec', new=apply_reset):
-            first.open_filter()
-        self.assertEqual(first.geography, {})
-        self.assertEqual(first.result.totals['count'], 3)
-
-    def test_analysis_menu_opens_reuses_and_refreshes_current_data(self):
+    def test_analysis_uses_the_same_nir_filters_and_exports_conditions(self):
         window = MainWindow(self.path)
+        page = window.pages["nir"]
+        page.geography["city"].setCurrentIndex(page.geography["city"].findData("Томск"))
+        page.rubric.setCurrentIndex(page.rubric.findData("20"))
+        self.assertEqual(page.model.rowCount(), 1)
+        reports = []
+        directory = self.path.parent / "SUBD" / "Экспорт"
+        folders = {
+            "vuz": "НИР по вузам", "grnti": "НИР по рубрикам ГРНТИ", "character": "НИР по характеру",
+        }
+
+        def inspect_report(dialog):
+            reports.append((dialog.kind, dialog.result.source_count))
+            self.assertEqual(dialog.geography["city"], "Томск")
+            self.assertEqual(dialog.rubric, "20")
+            folder = directory / folders[dialog.kind]
+            title = dialog.config["title"]
+            stem = f"09.11.2026 — Отчёт — {title}"
+            with (patch("report_export.QStandardPaths.writableLocation", return_value=str(self.path.parent)),
+                  patch("report_export.QFileDialog.getExistingDirectory", side_effect=lambda _, __, path: path),
+                  patch.object(QMessageBox, "information") as notice, patch("analysis_forms.date") as clock):
+                clock.today.return_value = date(2026, 11, 9)
+                dialog.export_report()
+                if dialog.kind == "vuz":
+                    dialog.export_report()
+                    self.assertEqual(notice.call_count, 2)
+                    self.assertTrue((folder / f"{stem} (2).xlsx").is_file())
+            with closing(load_workbook(folder / f"{stem}.xlsx", read_only=True)) as workbook:
+                sheet = workbook.active
+                values = list(sheet.values)
+                self.assertEqual(sheet.title, folder.name)
+                self.assertEqual(sheet["A2"].value, title)
+                text = "\n".join(str(row[0]) for row in values if row)
+                for value in ("Томск", "Информатика", "09.11.2026"):
+                    self.assertIn(value, text)
+                if dialog.kind == "vuz":
+                    self.assertEqual(values[-1], ("Итого", None, 1, 300, 0))
+                elif dialog.kind == "grnti":
+                    self.assertIn(("20", "Информатика", 1), values)
+                else:
+                    self.assertEqual(values[-1], ("Итого", None, 1, 300))
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(AnalysisDialog, "exec", new=inspect_report):
+            for kind in ("vuz", "grnti", "character"):
+                window.open_analysis(kind)
+        self.assertEqual(reports, [("vuz", 1), ("grnti", 1), ("character", 1)])
+        self.assertEqual({folder.name for folder in directory.iterdir()}, {*folders.values(), "Распределение траншей"})
+        page.clear_filter()
+        self.assertEqual(build_report("character", path=self.path).source_count, 3)
+
+    def test_export_uses_moved_desktop_folder_and_confirms_directory_before_saving(self):
+        desktop = self.path.parent / "Desktop"
+        documents = self.path.parent / "Documents"
+        working = desktop / "SUBD" / "Экспорт" / "НИР по вузам"
+        testing = desktop / "SUBD" / "Тестовый экспорт" / "НИР по вузам"
+        custom = self.path.parent / "Custom"
+        for folder in (working, testing, custom, documents / "SUBD" / "Экспорт"):
+            folder.mkdir(parents=True)
+        dialog = AnalysisDialog(self.path, "vuz")
+
+        def standard_location(location):
+            return str(desktop if location == QStandardPaths.StandardLocation.DesktopLocation else documents)
+
+        with (patch("report_export.QStandardPaths.writableLocation", side_effect=standard_location),
+              patch("report_export.QFileDialog.getExistingDirectory") as chooser,
+              patch.object(QMessageBox, "information"),
+              patch.object(QMessageBox, "warning") as warning):
+            chooser.return_value = ""
+            dialog.export_report()
+            self.assertEqual(Path(chooser.call_args.args[2]), working)
+            self.assertEqual(list(working.glob("*.xlsx")), [])
+
+            chooser.return_value = str(custom)
+            dialog.export_report()
+            self.assertEqual(len(list(custom.glob("*.xlsx"))), 1)
+            self.assertEqual(list(working.glob("*.xlsx")), [])
+
+            self.app.setProperty(TEST_COPY_PROPERTY, True)
+            try:
+                chooser.return_value = str(working)
+                dialog.export_report()
+                warning.assert_called_once()
+                self.assertEqual(list(working.glob("*.xlsx")), [])
+                self.assertEqual(Path(chooser.call_args.args[2]), testing)
+
+                chooser.return_value = str(testing)
+                dialog.export_report()
+                self.assertEqual(len(list(testing.glob("*.xlsx"))), 1)
+            finally:
+                self.app.setProperty(TEST_COPY_PROPERTY, None)
+
+    def test_funding_approval_is_atomic_idempotent_and_locks_nir(self):
+        save_actual_financing([(1, 20)], path=self.path)
+        snapshot, orders = load_funding(self.path)
+        self.assertEqual(orders, [])
+        preview = preview_order(snapshot, 101, 2)
+        self.assertEqual(preview.order.allocations, ((1, "В1", 50), (2, "В2", 50)))
+        self.assertEqual(preview.order.total, 100)
+        self.assertEqual(load_funding(self.path), (snapshot, []))
+        order = approve_order(preview, path=self.path)
+        self.assertEqual(approve_order(preview, path=self.path), order)
+        self.assertEqual((order.number, order.quarter), (1, 2))
+        current, orders = load_funding(self.path)
+        self.assertEqual(orders, [order])
+        self.assertEqual(current.actual, 120)
+        self.assertEqual(self.rows("SELECT z18 FROM financing ORDER BY codvuz"), [{"z18": 70}, {"z18": 50}])
+
+        second = approve_order(preview_order(current, 100, 2), path=self.path)
+        self.assertEqual(second.number, 2)
+        self.assertEqual(load_funding(self.path)[0].actual, 220)
+        for operation in (
+            lambda: save_nir(self.values, path=self.path),
+            lambda: save_nir(self.values, 1, path=self.path),
+            lambda: delete_nir(1, path=self.path),
+            lambda: save_actual_financing([(1, 0)], path=self.path),
+        ):
+            with self.assertRaises(ValueError):
+                operation()
+        with closing(sqlite3.connect(self.path)) as conn:
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute("DELETE FROM nir WHERE id=1")
+            with self.assertRaises(ValueError):
+                rebuild_financing(conn)
+        prepare_database(self.path)
+        self.assertEqual(load_funding(self.path)[0].actual, 220)
+        self.assertEqual(len(self.rows("SELECT id FROM nir")), 3)
+
+    def test_funding_stale_preview_and_failed_write_do_not_approve(self):
+        initial, _ = load_funding(self.path)
+        stale = preview_order(initial, 100, 1)
+        save_nir(self.values, path=self.path)
+        with self.assertRaisesRegex(ValueError, "изменились"):
+            approve_order(stale, path=self.path)
+
+        current, _ = load_funding(self.path)
+        preview = preview_order(current, 100, 1)
+        with closing(sqlite3.connect(self.path)) as conn, conn:
+            conn.execute("""CREATE TRIGGER fail_funding BEFORE UPDATE OF z18 ON financing
+                            WHEN NEW.codvuz=2 BEGIN SELECT RAISE(ABORT, 'test failure'); END""")
+        with self.assertRaises(sqlite3.IntegrityError):
+            approve_order(preview, path=self.path)
+        self.assertEqual(load_funding(self.path), (current, []))
+        self.assertEqual(self.rows("SELECT * FROM change_log WHERE table_name='financing'"), [])
+        delete_nir(1, path=self.path)
+
+    def test_funding_window_approval_updates_main_window_and_archive(self):
+        window = MainWindow(self.path)
+        root = self.path.parent / "SUBD" / "Экспорт"
+        directory = root / "Распределение траншей"
+
+        def interact(dialog):
+            dialog.rate.setText("25")
+            dialog.update_input("rate")
+            self.assertEqual(dialog.amount.text(), "150")
+            self.assertIsNone(dialog.quarter.currentData())
+            self.assertFalse(dialog.calculate_button.isEnabled())
+            dialog.quarter.setCurrentIndex(dialog.quarter.findData(2))
+            self.assertTrue(dialog.calculate_button.isEnabled())
+            dialog.calculate()
+            self.assertEqual(dialog.order.total, 150)
+            dialog.reset_preview()
+            self.assertFalse(dialog.approve_button.isEnabled())
+            self.assertEqual(load_funding(self.path)[1], [])
+            dialog.calculate()
+            with (patch("report_export.QStandardPaths.writableLocation", return_value=str(self.path.parent)),
+                  patch("report_export.QFileDialog.getExistingDirectory", side_effect=lambda _, __, path: path),
+                  patch.object(QMessageBox, "information"), patch("funding_forms.date") as clock):
+                clock.today.return_value = date(2026, 11, 9)
+                dialog.save_document()
+            self.assertTrue((directory / "09.11.2026 — Проект распоряжения о финансировании вузов — 2-й квартал.xlsx").is_file())
+            self.assertFalse((root / "Распоряжения").exists())
+            with (patch("funding_operations.date") as clock,
+                  patch("report_export.QStandardPaths.writableLocation", return_value=str(self.path.parent)),
+                  patch("report_export.QFileDialog.getExistingDirectory") as picker,
+                  patch.object(QMessageBox, "information")):
+                clock.today.return_value = date(2026, 11, 8)
+                dialog.approve()
+                picker.assert_not_called()
+            self.assertEqual(dialog.order.number, 1)
+            self.assertFalse(dialog.approve_button.isEnabled())
+            self.assertFalse(dialog.save_button.isEnabled())
+            self.assertTrue(dialog.recover_button.isHidden())
+            self.assertIn("Факт: 150 ₽", dialog.summary.text())
+            output = root / "Распоряжения" / "08.11.2026 — Распоряжение о финансировании вузов № 1 — 2-й квартал.xlsx"
+            with closing(load_workbook(output, read_only=True)) as workbook:
+                self.assertEqual(workbook.active["A2"].value, "Распоряжение о финансировании вузов № 1 от 08.11.2026")
+                self.assertEqual(workbook.active["A4"].value, "Утверждённое распоряжение")
+                rows = list(workbook.active.values)
+                self.assertEqual(rows[-3], (1, "В1", 75))
+                self.assertEqual(rows[-1], (None, "Итого, руб.", 150))
+            dialog.history.setCurrentIndex(0)
+            self.assertIsNone(dialog.quarter.currentData())
+            self.assertFalse(dialog.calculate_button.isEnabled())
+            return QDialog.DialogCode.Accepted
+
+        with patch.object(FundingDialog, "exec", new=interact):
+            window.open_funding()
+        self.assertFalse(window.pages["nir"].add_button.isEnabled())
+        self.assertFalse(window.recalculate_action.isEnabled())
+        self.assertEqual(build_report("vuz", path=self.path).totals["actual"], 150)
+        with patch("report_export.QStandardPaths.writableLocation", return_value=str(self.path.parent)):
+            reopened = FundingDialog(self.path)
+            self.assertIsNone(reopened.quarter.currentData())
+            reopened.history.setCurrentIndex(1)
+            self.assertEqual(reopened.order.number, 1)
+            self.assertEqual(reopened.quarter.currentData(), 2)
+            self.assertTrue(reopened.recover_button.isHidden())
+
+    def test_funding_recovers_failed_automatic_export_without_approving_again(self):
+        self.app.setProperty(TEST_COPY_PROPERTY, True)
         try:
-            self.assertEqual(window.table_stack.count(), 4)
-            window.analysis_actions['vuz'].trigger()
-            report = window.analysis_windows['vuz']
-            self.assertTrue(report.isVisible())
-            self.assertFalse(report.isModal())
-            window.analysis_actions['vuz'].trigger()
-            self.assertIs(window.analysis_windows['vuz'], report)
-            page = window.pages['financing']
-            row = next(i for i in range(page.model.rowCount()) if page.model.record(i).value('codvuz') == 1)
-            page.model.setData(page.model.index(row, page.field_names.index('z18')), 123, Qt.ItemDataRole.EditRole)
-            report.refresh_button.click()
-            self.assertEqual(report.result.totals['actual'], 123)
-            save_nir(self.values, path=self.path)
-            window.reload_database_views()
-            self.assertEqual(report.result.totals['count'], 4)
-            self.assertEqual(report.result.totals['planned'], 1050)
-            window.analysis_actions['character'].trigger()
-            self.assertEqual(window.analysis_windows['character'].result.totals['count'], 4)
-            report.close()
-            save_nir(dict(self.values, rnw='008'), path=self.path)
-            window.analysis_actions['vuz'].trigger()
-            self.assertEqual(report.result.totals['count'], 5)
+            with (patch("report_export.QStandardPaths.writableLocation", return_value=str(self.path.parent)),
+                  patch.object(QMessageBox, "warning") as warning,
+                  patch.object(QMessageBox, "information")):
+                dialog = FundingDialog(self.path)
+                dialog.amount.setText("150")
+                dialog.update_input("amount")
+                dialog.quarter.setCurrentIndex(dialog.quarter.findData(2))
+                dialog.calculate()
+                with patch("funding_forms.save_order_file", side_effect=PermissionError("Доступ запрещён")):
+                    dialog.approve()
+                self.assertEqual(warning.call_args.args[1], "Распоряжение утверждено")
+                current, orders = load_funding(self.path)
+                self.assertEqual(current.actual, 150)
+                self.assertEqual(len(orders), 1)
+
+                reopened = FundingDialog(self.path)
+                reopened.history.setCurrentIndex(1)
+                self.assertFalse(reopened.recover_button.isHidden())
+                reopened.recover_order_file()
+                reopened.recover_order_file()
+                self.assertTrue(reopened.recover_button.isHidden())
+                self.assertEqual(load_funding(self.path), (current, orders))
+                root = self.path.parent / "SUBD"
+                self.assertEqual(len(list((root / "Тестовый экспорт" / "Распоряжения").glob("*.xlsx"))), 1)
+                self.assertFalse((root / "Экспорт").exists())
         finally:
-            window.close()
-        self.assertFalse(report.isVisible())
+            self.app.setProperty(TEST_COPY_PROPERTY, None)
 
     def test_legacy_grnti_is_read_without_losing_codes(self):
         self.assertEqual(normalize_grnti_input("64.01.84 64.01.94"), "64.01.84; 64.01.94")
