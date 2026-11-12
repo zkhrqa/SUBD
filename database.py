@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections import Counter
+from contextlib import closing
 from pathlib import Path
 from typing import Iterable
 
@@ -10,6 +12,7 @@ import pandas as pd
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "lab1_v9.db"
+FUNDING_LOCK_MESSAGE = "После утверждения первого распоряжения изменения НИР и пересчёт плана заблокированы."
 
 
 def _open_sqlite(path: Path = DB_PATH) -> sqlite3.Connection:
@@ -50,6 +53,13 @@ def _clean_codvuz(value):
 def _normalize_rnw(value) -> str:
     # По замечанию преподавателя идентификатор храним без пробелов.
     return re.sub(r"\s+", "", _clean_text(value))
+
+
+def rnw_comparison_key(value) -> str:
+    number = _normalize_rnw(value)
+    if re.fullmatch(r"[0-9]+", number):
+        return number.lstrip("0") or "0"
+    return number
 
 
 def _normalize_grnti(value) -> str:
@@ -237,12 +247,16 @@ def ensure_financing_view(conn: sqlite3.Connection) -> None:
 
 
 def rebuild_financing(conn: sqlite3.Connection | None = None) -> None:
-    own = conn is None
     if conn is None:
-        conn = _open_sqlite(DB_PATH)
-    else:
-        conn.execute("PRAGMA busy_timeout = 30000")
-        conn.execute("PRAGMA foreign_keys = ON")
+        with closing(_open_sqlite(DB_PATH)) as own_conn, own_conn:
+            rebuild_financing(own_conn)
+        return
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA foreign_keys = ON")
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    if funding_started(conn):
+        raise ValueError(FUNDING_LOCK_MESSAGE)
 
     old_actual = {
         int(c): int(z18 or 0)
@@ -265,9 +279,6 @@ def rebuild_financing(conn: sqlite3.Connection | None = None) -> None:
         [(c, z2, int(z3), old_actual.get(int(c), 0), int(n)) for c, z2, z3, n in rows],
     )
     ensure_financing_view(conn)
-    if own:
-        conn.commit()
-        conn.close()
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
@@ -275,6 +286,12 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
     ).fetchone()
     return bool(row)
+
+
+def funding_started(conn: sqlite3.Connection) -> bool:
+    return _table_exists(conn, "funding_orders") and conn.execute(
+        "SELECT 1 FROM funding_orders LIMIT 1"
+    ).fetchone() is not None
 
 
 def _grnti_parts(text: str) -> Iterable[str]:
@@ -296,11 +313,12 @@ def run_validation(
     valid_vuz = {r[0] for r in conn.execute("SELECT codvuz FROM vuz")}
     valid_rub = {f"{int(r[0]):02d}" for r in conn.execute("SELECT codrub FROM grnti")}
 
-    for codvuz, rnw, count in conn.execute(
-        "SELECT codvuz,rnw,COUNT(*) FROM nir GROUP BY codvuz,rnw HAVING COUNT(*) > 1"
-    ):
-        issues.append(("ERROR", "nir", f"вуз={codvuz}, рег. номер={rnw}",
-                       f"Повтор регистрационного номера внутри вуза: {count} НИР. Требуется ручное исправление."))
+    numbers = Counter((codvuz, rnw_comparison_key(rnw))
+                      for codvuz, rnw in conn.execute("SELECT codvuz,rnw FROM nir"))
+    for (codvuz, rnw), count in numbers.items():
+        if count > 1:
+            issues.append(("ERROR", "nir", f"вуз={codvuz}, рег. номер={rnw}",
+                           f"Повтор регистрационного номера внутри вуза: {count} НИР. Требуется ручное исправление."))
 
     for row in conn.execute(
         "SELECT id,codvuz,rnw,f1,z2,f6,f10,f2,f7,f18 FROM nir ORDER BY id"

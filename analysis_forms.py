@@ -1,18 +1,22 @@
-"""Окна аналитики: просмотр, сортировка, независимые фильтры и закреплённые итоги."""
+"""Окна аналитики: просмотр, сортировка, экспорт и закреплённые итоги."""
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
 from pathlib import Path
 
 from PyQt6.QtCore import QAbstractTableModel, QEvent, QModelIndex, Qt, QTimer
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QFontMetrics
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHeaderView,
+    QApplication, QDialog, QHeaderView,
     QHBoxLayout, QLabel, QMessageBox, QPushButton, QTableView, QVBoxLayout,
 )
 
 from analysis_reports import REPORTS, build_report
-from geography_filters import GEOGRAPHY_FIELDS, populate_geography
+from report_export import save_workbook
+
+
+TEXT_COLUMN_LIMITS = {"vuz": 220, "rubric": 360, "character": 250}
 
 
 class ReportModel(QAbstractTableModel):
@@ -88,53 +92,17 @@ class ReportModel(QAbstractTableModel):
         self.endResetModel()
 
 
-class GeographyDialog(QDialog):
-    def __init__(self, path: Path, selected: dict, parent=None):
-        super().__init__(parent)
-        self.path, self.geography = path, {}
-        self.setWindowTitle("Фильтр аналитического отчёта")
-        self.resize(650, 270)
-        layout = QVBoxLayout(self)
-        form = QFormLayout()
-        for field, label in GEOGRAPHY_FIELDS:
-            combo = QComboBox()
-            combo.setMinimumContentsLength(24)
-            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-            self.geography[field] = combo
-            combo.currentIndexChanged.connect(lambda _, name=field: self.changed(name))
-            form.addRow(label, combo)
-        populate_geography(self.geography, path, selected)
-        layout.addLayout(form)
-        hint = QLabel("Можно начать выбор с любого уровня. Условия применяются только к этому отчёту.")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Применить")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
-        self.reset_button = buttons.addButton("Сбросить", QDialogButtonBox.ButtonRole.ResetRole)
-        self.reset_button.clicked.connect(lambda: populate_geography(self.geography, self.path, {}))
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def changed(self, field):
-        populate_geography(self.geography, self.path, after=field)
-
-    def values(self):
-        return {field: combo.currentData() for field, combo in self.geography.items()
-                if combo.currentData() is not None}
-
-
 class AnalysisDialog(QDialog):
-    def __init__(self, path: Path, kind: str, parent=None, before_refresh=None):
+    def __init__(self, path: Path, kind: str, parent=None, *, geography=None,
+                 rubric=None, filter_description="Без фильтра"):
         super().__init__(parent)
-        self.path, self.kind, self.before_refresh = path, kind, before_refresh
-        self.geography = {}
+        self.path, self.kind = path, kind
+        self.geography, self.rubric = dict(geography or {}), rubric
+        self.filter_description = filter_description
         self.result = None
         self.config = REPORTS[kind]
         self.setWindowTitle(self.config["title"])
-        self.resize(1100, 700)
-        self.setMinimumSize(740, 430)
+        self.setMinimumSize(360, 220)
         layout = QVBoxLayout(self)
         title = QLabel(self.config["title"])
         title.setStyleSheet("font-size: 17px; font-weight: bold;")
@@ -150,11 +118,12 @@ class AnalysisDialog(QDialog):
         self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().hide()
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.setWordWrap(True)
         self.table.setTextElideMode(Qt.TextElideMode.ElideNone)
         self.table.setSortingEnabled(True)
         self.table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
-        self.table.horizontalHeader().setMinimumSectionSize(75)
+        self.table.horizontalHeader().setMinimumSectionSize(36)
         layout.addWidget(self.table, 1)
 
         self.footer = QTableView()
@@ -168,7 +137,7 @@ class AnalysisDialog(QDialog):
         self.footer.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.footer.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         self.footer.setFixedHeight(34)
-        layout.addWidget(self.footer, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.footer)
         self.sync_timer = QTimer(self)
         self.sync_timer.setSingleShot(True)
         self.sync_timer.timeout.connect(self.sync_footer)
@@ -180,17 +149,18 @@ class AnalysisDialog(QDialog):
         self.filter_summary.setWordWrap(True)
         layout.addWidget(self.filter_summary)
         controls = QHBoxLayout()
-        self.filter_button, self.refresh_button = QPushButton("Фильтр"), QPushButton("Обновить")
+        self.export_button = QPushButton("Сохранить отчёт")
+        self.export_button.setEnabled(False)
+        self.export_button.clicked.connect(self.export_report)
         self.close_button = QPushButton("Закрыть")
-        self.filter_button.clicked.connect(self.open_filter)
-        self.refresh_button.clicked.connect(lambda: self.reload())
         self.close_button.clicked.connect(self.close)
-        controls.addWidget(self.filter_button)
-        controls.addWidget(self.refresh_button)
+        controls.addWidget(self.export_button)
         controls.addStretch()
         controls.addWidget(self.close_button)
         layout.addLayout(controls)
-        self.reload()
+        self.ensurePolished()
+        if self.reload():
+            self.fit_window()
 
     def eventFilter(self, watched, event):
         if watched is self.table.viewport() and event.type() in (QEvent.Type.Resize, QEvent.Type.Show):
@@ -200,45 +170,72 @@ class AnalysisDialog(QDialog):
     def sync_footer(self, *_):
         if not self.footer_model.rowCount():
             return
-        self.footer.setFixedWidth(self.table.viewport().width() + 2 * self.footer.frameWidth())
         for column in range(self.model.columnCount()):
             self.footer.setColumnWidth(column, self.table.columnWidth(column))
         self.footer.horizontalHeader().setOffset(self.table.horizontalHeader().offset())
         self.footer.viewport().update()
 
-    def reload(self, geography=None):
-        if self.before_refresh is not None and not self.before_refresh():
-            return False
-        selected = self.geography if geography is None else geography
+    def fit_columns(self):
+        self.table.resizeColumnsToContents()
+        for column, (field, _) in enumerate(self.model.columns):
+            width = self.table.columnWidth(column)
+            if field in TEXT_COLUMN_LIMITS:
+                width = min(width, TEXT_COLUMN_LIMITS[field])
+            if self.footer_model.rowCount():
+                index = self.footer_model.index(0, column)
+                text = self.footer_model.data(index)
+                metrics = QFontMetrics(self.footer_model.data(index, Qt.ItemDataRole.FontRole))
+                width = max(width, metrics.horizontalAdvance(text) + 16)
+            self.table.setColumnWidth(column, width)
+        self.table.resizeRowsToContents()
+
+    def fit_window(self):
+        layout = self.layout()
+        margins = layout.contentsMargins()
+        frame = 2 * self.table.frameWidth()
+        table_width = self.table.horizontalHeader().length() + frame
+        table_width += self.table.verticalScrollBar().sizeHint().width()
+        table_height = self.table.horizontalHeader().sizeHint().height() + self.table.verticalHeader().length()
+        width = max(410, table_width + margins.left() + margins.right())
+        if self.kind == "character":
+            scrollbar = self.table.horizontalScrollBar().sizeHint().height()
+            self.table.setMinimumHeight(table_height + frame + scrollbar)
+            height = max(layout.totalMinimumSize().height(), layout.minimumHeightForWidth(width))
+            self.setMinimumHeight(height)
+        else:
+            height = max(265, min(600, table_height + 165))
+        self.resize(width, height)
+
+    def reload(self):
         try:
-            result = build_report(self.kind, selected, path=self.path)
+            result = build_report(self.kind, self.geography, rubric=self.rubric, path=self.path)
         except (sqlite3.Error, ValueError) as exc:
-            QMessageBox.warning(self, "Отчёт не обновлён", str(exc))
+            QMessageBox.warning(self, "Отчёт не построен", str(exc))
             return False
-        self.geography, self.result = dict(selected), result
+        self.result = result
+        self.export_button.setEnabled(True)
         self.model.replace(result.rows)
         self.footer_model.replace([result.totals] if result.totals is not None else [])
         self.footer.setVisible(result.totals is not None)
-        self.table.resizeColumnsToContents()
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.resizeRowsToContents()
-        for column in range(self.footer_model.columnCount()):
-            if result.totals is not None:
-                # Итоги также участвуют в подборе ширины числовых колонок.
-                text = self.footer_model.data(self.footer_model.index(0, column))
-                width = self.footer.fontMetrics().horizontalAdvance(text) + 32
-                if column != 1:
-                    self.table.setColumnWidth(column, max(width, self.table.columnWidth(column)))
-        self.footer.setRowHeight(0, 32)
+        self.fit_columns()
+        if self.footer_model.rowCount():
+            self.footer.setRowHeight(0, 32)
         units = {"vuz": "Вузов", "grnti": "Рубрик", "character": "Характеров"}[self.kind]
-        description = " · ".join(f"{dict(GEOGRAPHY_FIELDS)[field]}: {value}" for field, value in self.geography.items())
-        status = f"Фильтр: {description}" if description else "Без фильтра"
-        self.filter_summary.setText(f"{status} · {units}: {len(result.rows)} · НИР в выборке: {result.source_count}")
+        self.filter_summary.setText(
+            f"{self.filter_description} · {units}: {len(result.rows)} · НИР в выборке: {result.source_count}"
+        )
         self.sync_timer.start(0)
         return True
 
-    def open_filter(self):
-        dialog = GeographyDialog(self.path, self.geography, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.reload(dialog.values())
-        dialog.deleteLater()
+    def export_report(self):
+        columns = self.config["columns"]
+        rows = [tuple(row.get(field) for field, _ in columns) for row in self.model.rows]
+        totals = tuple(self.result.totals.get(field) for field, _ in columns) if self.result.totals else ()
+        title = self.config["title"]
+        report_date = date.today()
+        details = ("Вид документа: аналитический отчёт",
+                   f"Дата формирования: {report_date:%d.%m.%Y}",
+                   *self.filter_summary.text().split(" · "))
+        save_workbook(self, self.kind, f"Отчёт — {title}", document_date=report_date,
+                      title=title, details=details, columns=[label for _, label in columns],
+                      rows=rows, totals=totals)
